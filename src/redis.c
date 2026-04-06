@@ -2,7 +2,6 @@
 #include "redis.h"
 
 struct redis_connection {
-    int fd;
     int port;
     char *host;
 };
