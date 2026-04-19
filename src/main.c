@@ -23,34 +23,12 @@ typedef struct
 	struct sockaddr_in client_addr;
 } server_thread_params_t;
 
-
-typedef struct StreamEntry
-{
-	// Temporary representation used while parsing XADD arguments.
-	char* id;
-	char** fields;
-	int field_count;
-	struct StreamEntry* next;
-} StreamEntry;
-
-// Frees a temporary StreamEntry and all memory it owns.
-static void free_stream_entry(StreamEntry *stream)
-{
-	if (stream == NULL)
-	{
-		return;
-	}
-	if (stream->fields != NULL)
-	{
-		for (int i = 0; i < stream->field_count; ++i)
-		{
-			free(stream->fields[i]);
-		}
-		free(stream->fields);
-	}
-	free(stream->id);
-	free(stream);
-}
+typedef enum {
+	XADD_ID_OK = 0,
+	XADD_ID_PARSE_ERROR = 1,
+	XADD_ID_MUST_BE_GREATER_THAN_ZERO = 2,
+	XADD_ID_NOT_GREATER_THAN_TOP = 3
+} xadd_id_status_t;
 
 // Parses a stream ID in the form "<milliseconds>-<sequence>".
 static bool parse_stream_id_parts(const char *id, int64_t *ms_out, int64_t *seq_out)
@@ -79,22 +57,90 @@ static bool parse_stream_id_parts(const char *id, int64_t *ms_out, int64_t *seq_
 	return true;
 }
 
-// Lexicographic compare for stream IDs by numeric (ms, seq) tuple.
-// On parse failure, sets *ok to false so callers do not confuse errors with equality.
-static int compare_stream_ids(const char *lhs, const char *rhs, bool *ok)
+// Parses stream IDs in the "<milliseconds>-*" form.
+static bool parse_stream_ms_wildcard(const char *id, int64_t *ms_out)
 {
-	int64_t lhs_ms;
-	int64_t lhs_seq;
-	int64_t rhs_ms;
-	int64_t rhs_seq;
-
-	if (!parse_stream_id_parts(lhs, &lhs_ms, &lhs_seq) || !parse_stream_id_parts(rhs, &rhs_ms, &rhs_seq))
+	char *endptr;
+	const char *dash = strchr(id, '-');
+	if (dash == NULL || dash == id || strcmp(dash + 1, "*") != 0)
 	{
-		*ok = false;
-		return 0;
+		return false;
 	}
-	*ok = true;
 
+	errno = 0;
+	*ms_out = strtoll(id, &endptr, 10);
+	if (errno != 0 || endptr != dash || *ms_out < 0)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+// Extracts "id" from "id<TAB>field<TAB>value" and parses it to numeric parts.
+static bool parse_last_serialized_stream_id(const char *serialized, int64_t *ms_out, int64_t *seq_out)
+{
+	const char *tab = strchr(serialized, '\t');
+	if (tab == NULL)
+	{
+		return false;
+	}
+
+	size_t id_len = (size_t)(tab - serialized);
+	if (id_len == 0 || id_len >= 513)
+	{
+		return false;
+	}
+
+	char id_buf[513];
+	memcpy(id_buf, serialized, id_len);
+	id_buf[id_len] = '\0';
+
+	return parse_stream_id_parts(id_buf, ms_out, seq_out);
+}
+
+// Parses "id<TAB>field<TAB>value" rows used by this stream implementation.
+static bool parse_serialized_stream_row(const char *serialized,
+	char *id_out,
+	size_t id_out_size,
+	char *field_out,
+	size_t field_out_size,
+	char *value_out,
+	size_t value_out_size)
+{
+	const char *tab1 = strchr(serialized, '\t');
+	if (tab1 == NULL)
+	{
+		return false;
+	}
+
+	const char *tab2 = strchr(tab1 + 1, '\t');
+	if (tab2 == NULL)
+	{
+		return false;
+	}
+
+	size_t id_len = (size_t)(tab1 - serialized);
+	size_t field_len = (size_t)(tab2 - (tab1 + 1));
+	const char *value_start = tab2 + 1;
+	size_t value_len = strlen(value_start);
+
+	if (id_len == 0 || id_len >= id_out_size || field_len == 0 || field_len >= field_out_size || value_len >= value_out_size)
+	{
+		return false;
+	}
+
+	memcpy(id_out, serialized, id_len);
+	id_out[id_len] = '\0';
+	memcpy(field_out, tab1 + 1, field_len);
+	field_out[field_len] = '\0';
+	memcpy(value_out, value_start, value_len);
+	value_out[value_len] = '\0';
+	return true;
+}
+
+static int compare_stream_id_values(int64_t lhs_ms, int64_t lhs_seq, int64_t rhs_ms, int64_t rhs_seq)
+{
 	if (lhs_ms < rhs_ms)
 	{
 		return -1;
@@ -112,6 +158,70 @@ static int compare_stream_ids(const char *lhs, const char *rhs, bool *ok)
 		return 1;
 	}
 	return 0;
+}
+
+// Resolves explicit and wildcard XADD IDs to concrete numeric IDs.
+static xadd_id_status_t resolve_xadd_id(const char *requested_id,
+	bool has_last,
+	int64_t last_ms,
+	int64_t last_seq,
+	int64_t now_ms,
+	int64_t *out_ms,
+	int64_t *out_seq)
+{
+	int64_t req_ms;
+	int64_t req_seq;
+
+	if (strcmp(requested_id, "*") == 0)
+	{
+		if (!has_last || now_ms > last_ms)
+		{
+			req_ms = now_ms;
+			req_seq = 0;
+		}
+		else
+		{
+			req_ms = last_ms;
+			req_seq = last_seq + 1;
+		}
+	}
+	else if (parse_stream_ms_wildcard(requested_id, &req_ms))
+	{
+		if (!has_last)
+		{
+			req_seq = (req_ms == 0) ? 1 : 0;
+		}
+		else if (req_ms < last_ms)
+		{
+			return XADD_ID_NOT_GREATER_THAN_TOP;
+		}
+		else if (req_ms == last_ms)
+		{
+			req_seq = last_seq + 1;
+		}
+		else
+		{
+			req_seq = (req_ms == 0) ? 1 : 0;
+		}
+	}
+	else if (!parse_stream_id_parts(requested_id, &req_ms, &req_seq))
+	{
+		return XADD_ID_PARSE_ERROR;
+	}
+
+	if (req_ms == 0 && req_seq == 0)
+	{
+		return XADD_ID_MUST_BE_GREATER_THAN_ZERO;
+	}
+
+	if (has_last && (req_ms < last_ms || (req_ms == last_ms && req_seq <= last_seq)))
+	{
+		return XADD_ID_NOT_GREATER_THAN_TOP;
+	}
+
+	*out_ms = req_ms;
+	*out_seq = req_seq;
+	return XADD_ID_OK;
 }
 
 // Global in-memory key/value store guarded by a single mutex.
@@ -665,80 +775,29 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 		return type_str;
 	} else if (strncasecmp(cmd_start, "XADD", 4) == 0)
 	{
-		// Minimal XADD supporting explicit IDs and one field/value pair.
+		// XADD supports explicit IDs plus wildcard forms: * and <ms>-*.
 		char stream_key[513];
 		char id_buf[513];
 		char field_buf[513];
 		char value_buf[513];
+		char resolved_id_buf[513];
 		const char *cursor = cmd_start + cmd_len;
-		StreamEntry* stream = malloc(sizeof(StreamEntry));
-		if (stream == NULL)
-		{
-			return "-ERR\r\n";
-		}
-		stream->id = NULL;
-		stream->fields = NULL;
-		stream->field_count = 0;
-		stream->next = NULL;
 
 		if (!parse_bulk_string(input, &cursor, stream_key, sizeof(stream_key)))
 		{
-			free_stream_entry(stream);
 			return "-ERR\r\n";
 		}
 		if (!parse_bulk_string(input, &cursor, id_buf, sizeof(id_buf)))
 		{
-			free_stream_entry(stream);
 			return "-ERR\r\n";
 		}
 		if (!parse_bulk_string(input, &cursor, field_buf, sizeof(field_buf)))
 		{
-			free_stream_entry(stream);
 			return "-ERR\r\n";
 		}
 		if (!parse_bulk_string(input, &cursor, value_buf, sizeof(value_buf)))
 		{
-			free_stream_entry(stream);
 			return "-ERR\r\n";
-		}
-		stream->id = strdup(id_buf);
-		if (stream->id == NULL)
-		{
-			free_stream_entry(stream);
-			return "-ERR\r\n";
-		}
-		stream->fields = malloc(2 * sizeof(char*));
-		if (stream->fields == NULL)
-		{
-			free_stream_entry(stream);
-			return "-ERR\r\n";
-		}
-		stream->fields[0] = strdup(field_buf);
-		if (stream->fields[0] == NULL)
-		{
-			free_stream_entry(stream);
-			return "-ERR\r\n";
-		}
-		stream->fields[1] = strdup(value_buf);
-		if (stream->fields[1] == NULL)
-		{
-			free_stream_entry(stream);
-			return "-ERR\r\n";
-		}
-		stream->field_count = 2;
-		stream->next = NULL;
-
-		int64_t req_ms;
-		int64_t req_seq;
-		if (!parse_stream_id_parts(stream->id, &req_ms, &req_seq))
-		{
-			free_stream_entry(stream);
-			return "-ERR The ID specified in XADD is not valid\r\n";
-		}
-		if (req_ms == 0 && req_seq == 0)
-		{
-			free_stream_entry(stream);
-			return "-ERR The ID specified in XADD must be greater than 0-0\r\n";
 		}
 		
 		pthread_mutex_lock(&listmap_mutex);
@@ -748,7 +807,6 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 			if (listmap->count == listMapCapacity)
 			{
 				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
 				return "-ERR list map is full\r\n";
 			}
 			entry = &listmap->kvPairs[listmap->count];
@@ -756,7 +814,6 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 			if (entry->key == NULL)
 			{
 				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
 				return "-ERR\r\n";
 			}
 			entry->type = LIST_MAP_VALUE_STREAM;
@@ -769,48 +826,51 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 		else if (entry->type != LIST_MAP_VALUE_STREAM)
 		{
 			pthread_mutex_unlock(&listmap_mutex);
-			free_stream_entry(stream);
 			return "-ERR\r\n";
 		}
 
-		// since stream entries are stored in the same list structure as lists, we can reuse the list capacity logic for streams as well. The only difference is that for streams we need to ensure that the new entry ID is greater than the last entry ID in the stream, which is not a requirement for lists.
-		if (entry->data.list.count > 0)
+		int64_t last_ms = 0;
+		int64_t last_seq = 0;
+		bool has_last_id = entry->data.list.count > 0;
+		if (has_last_id)
 		{
-			// Ensure stream IDs are strictly increasing.
 			char *last_serialized = entry->data.list.items[entry->data.list.count - 1];
-			char *tab = strchr(last_serialized, '\t');
-			if (tab == NULL)
+			if (!parse_last_serialized_stream_id(last_serialized, &last_ms, &last_seq))
 			{
 				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
 				return "-ERR\r\n";
-			}
-
-			size_t last_id_len = (size_t)(tab - last_serialized);
-			if (last_id_len >= sizeof(id_buf))
-			{
-				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
-				return "-ERR\r\n";
-			}
-
-			char last_id_buf[513];
-			memcpy(last_id_buf, last_serialized, last_id_len);
-			last_id_buf[last_id_len] = '\0';
-			bool compare_ok;
-			if (compare_stream_ids(stream->id, last_id_buf, &compare_ok) <= 0)
-			{
-				if (!compare_ok)
-				{
-					pthread_mutex_unlock(&listmap_mutex);
-					free_stream_entry(stream);
-					return "-ERR\r\n";
-				}
-				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
-				return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
 			}
 		}
+
+		int64_t resolved_ms;
+		int64_t resolved_seq;
+		xadd_id_status_t status = resolve_xadd_id(
+			id_buf,
+			has_last_id,
+			last_ms,
+			last_seq,
+			current_time_millis(),
+			&resolved_ms,
+			&resolved_seq
+		);
+
+		if (status == XADD_ID_PARSE_ERROR)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "-ERR The ID specified in XADD is not valid\r\n";
+		}
+		if (status == XADD_ID_MUST_BE_GREATER_THAN_ZERO)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+		}
+		if (status == XADD_ID_NOT_GREATER_THAN_TOP)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+		}
+
+		snprintf(resolved_id_buf, sizeof(resolved_id_buf), "%lld-%lld", (long long)resolved_ms, (long long)resolved_seq);
 
 		if (entry->data.list.count == entry->data.list.capacity)
 		{
@@ -820,29 +880,446 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 			if (new_items == NULL)
 			{
 				pthread_mutex_unlock(&listmap_mutex);
-				free_stream_entry(stream);
 				return "-ERR\r\n";
 			}
 			entry->data.list.items = new_items;
 			entry->data.list.capacity = new_capacity;
 		}
 
-		size_t serialized_len = strlen(stream->id) + 1 + strlen(stream->fields[0]) + 1 + strlen(stream->fields[1]);
+		size_t serialized_len = strlen(resolved_id_buf) + 1 + strlen(field_buf) + 1 + strlen(value_buf);
 		char *serialized = malloc(serialized_len + 1);
 
 		if (serialized == NULL)
 		{
 			pthread_mutex_unlock(&listmap_mutex);
-			free_stream_entry(stream);
 			return "-ERR\r\n";
 		}
 
 		// Store stream rows as a compact "id<TAB>field<TAB>value" string for now.
-		snprintf(serialized, serialized_len + 1, "%s\t%s\t%s", stream->id, stream->fields[0], stream->fields[1]);
+		snprintf(serialized, serialized_len + 1, "%s\t%s\t%s", resolved_id_buf, field_buf, value_buf);
 		entry->data.list.items[entry->data.list.count++] = serialized;
+		// Wake any threads blocked on XREAD BLOCK.
+		pthread_cond_broadcast(&listmap_cond);
 		pthread_mutex_unlock(&listmap_mutex);
-		snprintf(buffer, buffer_size, "$%zu\r\n%s\r\n", strlen(stream->id), stream->id);
-		free_stream_entry(stream);
+		snprintf(buffer, buffer_size, "$%zu\r\n%s\r\n", strlen(resolved_id_buf), resolved_id_buf);
+		return buffer;
+	} else if (strncasecmp(cmd_start, "XRANGE", 6) == 0)
+	{
+		// XRANGE returns stream rows within an inclusive [start, end] ID range.
+		const char *cursor = cmd_start + cmd_len;
+		char stream_key[513];
+		char start_id_buf[513];
+		char end_id_buf[513];
+		int64_t start_ms = 0;
+		int64_t start_seq = 0;
+		int64_t end_ms = 0;
+		int64_t end_seq = 0;
+		bool has_start = false;
+		bool has_end = false;
+
+		if (!parse_bulk_string(input, &cursor, stream_key, sizeof(stream_key)))
+		{
+			return "-ERR\r\n";
+		}
+		if (!parse_bulk_string(input, &cursor, start_id_buf, sizeof(start_id_buf)))
+		{
+			return "-ERR\r\n";
+		}
+		if (!parse_bulk_string(input, &cursor, end_id_buf, sizeof(end_id_buf)))
+		{
+			return "-ERR\r\n";
+		}
+
+		if (strcmp(start_id_buf, "-") != 0)
+		{
+			if (!parse_stream_id_parts(start_id_buf, &start_ms, &start_seq))
+			{
+				return "-ERR\r\n";
+			}
+			has_start = true;
+		}
+
+		if (strcmp(end_id_buf, "+") != 0)
+		{
+			if (!parse_stream_id_parts(end_id_buf, &end_ms, &end_seq))
+			{
+				return "-ERR\r\n";
+			}
+			has_end = true;
+		}
+
+		if (has_start && has_end && compare_stream_id_values(start_ms, start_seq, end_ms, end_seq) > 0)
+		{
+			return "*0\r\n";
+		}
+
+		pthread_mutex_lock(&listmap_mutex);
+		struct key_value *entry = listMapFindEntry(listmap, stream_key);
+		if (entry == NULL || entry->type != LIST_MAP_VALUE_STREAM)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "*0\r\n";
+		}
+
+		size_t match_count = 0;
+		for (size_t i = 0; i < entry->data.list.count; ++i)
+		{
+			char id_part[513];
+			char field_part[513];
+			char value_part[513];
+			int64_t item_ms;
+			int64_t item_seq;
+
+			if (!parse_serialized_stream_row(entry->data.list.items[i], id_part, sizeof(id_part), field_part, sizeof(field_part), value_part, sizeof(value_part)))
+			{
+				continue;
+			}
+			if (!parse_stream_id_parts(id_part, &item_ms, &item_seq))
+			{
+				continue;
+			}
+
+			if (has_start && compare_stream_id_values(item_ms, item_seq, start_ms, start_seq) < 0)
+			{
+				continue;
+			}
+			if (has_end && compare_stream_id_values(item_ms, item_seq, end_ms, end_seq) > 0)
+			{
+				continue;
+			}
+
+			match_count++;
+		}
+
+		char *ptr = buffer;
+		size_t remaining = buffer_size;
+		int header_written = snprintf(ptr, remaining, "*%zu\r\n", match_count);
+		if (header_written < 0 || (size_t)header_written >= remaining)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "-ERR\r\n";
+		}
+		ptr += header_written;
+		remaining -= (size_t)header_written;
+
+		for (size_t i = 0; i < entry->data.list.count; ++i)
+		{
+			char id_part[513];
+			char field_part[513];
+			char value_part[513];
+			int64_t item_ms;
+			int64_t item_seq;
+
+			if (!parse_serialized_stream_row(entry->data.list.items[i], id_part, sizeof(id_part), field_part, sizeof(field_part), value_part, sizeof(value_part)))
+			{
+				continue;
+			}
+			if (!parse_stream_id_parts(id_part, &item_ms, &item_seq))
+			{
+				continue;
+			}
+
+			if (has_start && compare_stream_id_values(item_ms, item_seq, start_ms, start_seq) < 0)
+			{
+				continue;
+			}
+			if (has_end && compare_stream_id_values(item_ms, item_seq, end_ms, end_seq) > 0)
+			{
+				continue;
+			}
+
+			int wrote = snprintf(ptr,
+				remaining,
+				"*2\r\n$%zu\r\n%s\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+				strlen(id_part),
+				id_part,
+				strlen(field_part),
+				field_part,
+				strlen(value_part),
+				value_part);
+			if (wrote < 0 || (size_t)wrote >= remaining)
+			{
+				pthread_mutex_unlock(&listmap_mutex);
+				return "-ERR\r\n";
+			}
+
+			ptr += wrote;
+			remaining -= (size_t)wrote;
+		}
+		*ptr = '\0';
+
+		pthread_mutex_unlock(&listmap_mutex);
+		return buffer;
+	} else if (strncasecmp(cmd_start, "XREAD", 5) == 0)
+	{
+		// XREAD [BLOCK ms] STREAMS key [key ...] id [id ...]
+		const char *cursor = cmd_start + cmd_len;
+		char first_kw[32];
+		int64_t block_ms = -1; // -1 = non-blocking
+
+		if (!parse_bulk_string(input, &cursor, first_kw, sizeof(first_kw)))
+		{
+			return "-ERR\r\n";
+		}
+
+		if (strcasecmp(first_kw, "block") == 0)
+		{
+			char block_ms_buf[32];
+			if (!parse_bulk_string(input, &cursor, block_ms_buf, sizeof(block_ms_buf)))
+			{
+				return "-ERR\r\n";
+			}
+			block_ms = atoll(block_ms_buf);
+			char streams_kw[32];
+			if (!parse_bulk_string(input, &cursor, streams_kw, sizeof(streams_kw)))
+			{
+				return "-ERR\r\n";
+			}
+			if (strcasecmp(streams_kw, "streams") != 0)
+			{
+				return "-ERR\r\n";
+			}
+		}
+		else if (strcasecmp(first_kw, "streams") != 0)
+		{
+			return "-ERR\r\n";
+		}
+
+		// Collect all remaining tokens; first half are keys, second half are IDs.
+		char tokens[32][513];
+		int token_count = 0;
+		while (token_count < 32 && parse_bulk_string(input, &cursor, tokens[token_count], sizeof(tokens[0])))
+		{
+			token_count++;
+		}
+		if (token_count == 0 || token_count % 2 != 0)
+		{
+			return "-ERR\r\n";
+		}
+		int stream_count = token_count / 2;
+
+		// Resolve each last-id upfront ($ = current tail at time of call).
+		int64_t last_ms_arr[16];
+		int64_t last_seq_arr[16];
+
+		pthread_mutex_lock(&listmap_mutex);
+		for (int s = 0; s < stream_count; ++s)
+		{
+			const char *id_token = tokens[stream_count + s];
+			if (strcmp(id_token, "$") == 0)
+			{
+				last_ms_arr[s] = 0;
+				last_seq_arr[s] = 0;
+				struct key_value *e = listMapFindEntry(listmap, tokens[s]);
+				if (e != NULL && e->type == LIST_MAP_VALUE_STREAM && e->data.list.count > 0)
+				{
+					parse_last_serialized_stream_id(e->data.list.items[e->data.list.count - 1], &last_ms_arr[s], &last_seq_arr[s]);
+				}
+			}
+			else if (!parse_stream_id_parts(id_token, &last_ms_arr[s], &last_seq_arr[s]))
+			{
+				pthread_mutex_unlock(&listmap_mutex);
+				return "-ERR\r\n";
+			}
+		}
+
+		// BLOCK: compute deadline and wait until new entries arrive or timeout.
+		if (block_ms >= 0)
+		{
+			int64_t deadline_ms = 0;
+			if (block_ms > 0)
+			{
+				deadline_ms = current_time_millis() + block_ms;
+			}
+
+			while (true)
+			{
+				// Check if any stream has new entries.
+				bool has_data = false;
+				for (int s = 0; s < stream_count; ++s)
+				{
+					struct key_value *e = listMapFindEntry(listmap, tokens[s]);
+					if (e == NULL || e->type != LIST_MAP_VALUE_STREAM)
+					{
+						continue;
+					}
+					for (size_t i = 0; i < e->data.list.count; ++i)
+					{
+						char id_part[513], fp[513], vp[513];
+						int64_t im, iq;
+						if (!parse_serialized_stream_row(e->data.list.items[i], id_part, sizeof(id_part), fp, sizeof(fp), vp, sizeof(vp)))
+						{
+							continue;
+						}
+						if (!parse_stream_id_parts(id_part, &im, &iq))
+						{
+							continue;
+						}
+						if (compare_stream_id_values(im, iq, last_ms_arr[s], last_seq_arr[s]) > 0)
+						{
+							has_data = true;
+							break;
+						}
+					}
+					if (has_data)
+					{
+						break;
+					}
+				}
+
+				if (has_data)
+				{
+					break;
+				}
+
+				if (block_ms == 0)
+				{
+					// Block indefinitely.
+					pthread_cond_wait(&listmap_cond, &listmap_mutex);
+					continue;
+				}
+
+				int64_t now_ms = current_time_millis();
+				if (now_ms >= deadline_ms)
+				{
+					pthread_mutex_unlock(&listmap_mutex);
+					return "*-1\r\n";
+				}
+
+				int64_t remaining_block = deadline_ms - now_ms;
+				struct timespec ts;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_sec += (time_t)(remaining_block / 1000);
+				ts.tv_nsec += (long)((remaining_block % 1000) * 1000000);
+				if (ts.tv_nsec >= 1000000000L)
+				{
+					ts.tv_sec += 1;
+					ts.tv_nsec -= 1000000000L;
+				}
+
+				int wait_result = pthread_cond_timedwait(&listmap_cond, &listmap_mutex, &ts);
+				if (wait_result == ETIMEDOUT)
+				{
+					pthread_mutex_unlock(&listmap_mutex);
+					return "*-1\r\n";
+				}
+			}
+		}
+
+		// Pre-count matching entries per stream to know which streams have results.
+		size_t match_counts[16];
+		int streams_with_results = 0;
+		for (int s = 0; s < stream_count; ++s)
+		{
+			match_counts[s] = 0;
+			struct key_value *e = listMapFindEntry(listmap, tokens[s]);
+			if (e == NULL || e->type != LIST_MAP_VALUE_STREAM)
+			{
+				continue;
+			}
+			for (size_t i = 0; i < e->data.list.count; ++i)
+			{
+				char id_part[513], field_part[513], value_part[513];
+				int64_t item_ms, item_seq;
+				if (!parse_serialized_stream_row(e->data.list.items[i], id_part, sizeof(id_part), field_part, sizeof(field_part), value_part, sizeof(value_part)))
+				{
+					continue;
+				}
+				if (!parse_stream_id_parts(id_part, &item_ms, &item_seq))
+				{
+					continue;
+				}
+				if (compare_stream_id_values(item_ms, item_seq, last_ms_arr[s], last_seq_arr[s]) > 0)
+				{
+					match_counts[s]++;
+				}
+			}
+			if (match_counts[s] > 0)
+			{
+				streams_with_results++;
+			}
+		}
+
+		if (streams_with_results == 0)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "$-1\r\n";
+		}
+
+		char *ptr = buffer;
+		size_t remaining = buffer_size;
+		int wrote = snprintf(ptr, remaining, "*%d\r\n", streams_with_results);
+		if (wrote < 0 || (size_t)wrote >= remaining)
+		{
+			pthread_mutex_unlock(&listmap_mutex);
+			return "-ERR\r\n";
+		}
+		ptr += wrote;
+		remaining -= (size_t)wrote;
+
+		for (int s = 0; s < stream_count; ++s)
+		{
+			if (match_counts[s] == 0)
+			{
+				continue;
+			}
+			struct key_value *e = listMapFindEntry(listmap, tokens[s]);
+			if (e == NULL)
+			{
+				continue;
+			}
+
+			wrote = snprintf(ptr, remaining, "*2\r\n$%zu\r\n%s\r\n*%zu\r\n", strlen(tokens[s]), tokens[s], match_counts[s]);
+			if (wrote < 0 || (size_t)wrote >= remaining)
+			{
+				pthread_mutex_unlock(&listmap_mutex);
+				return "-ERR\r\n";
+			}
+			ptr += wrote;
+			remaining -= (size_t)wrote;
+
+			for (size_t i = 0; i < e->data.list.count; ++i)
+			{
+				char id_part[513];
+				char field_part[513];
+				char value_part[513];
+				int64_t item_ms;
+				int64_t item_seq;
+
+				if (!parse_serialized_stream_row(e->data.list.items[i], id_part, sizeof(id_part), field_part, sizeof(field_part), value_part, sizeof(value_part)))
+				{
+					continue;
+				}
+				if (!parse_stream_id_parts(id_part, &item_ms, &item_seq))
+				{
+					continue;
+				}
+				if (compare_stream_id_values(item_ms, item_seq, last_ms_arr[s], last_seq_arr[s]) <= 0)
+				{
+					continue;
+				}
+
+					wrote = snprintf(ptr,
+					remaining,
+					"*2\r\n$%zu\r\n%s\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+					strlen(id_part),
+					id_part,
+					strlen(field_part),
+					field_part,
+					strlen(value_part),
+					value_part);
+				if (wrote < 0 || (size_t)wrote >= remaining)
+				{
+					pthread_mutex_unlock(&listmap_mutex);
+					return "-ERR\r\n";
+				}
+				ptr += wrote;
+				remaining -= (size_t)wrote;
+			}
+		}
+
+		*ptr = '\0';
+		pthread_mutex_unlock(&listmap_mutex);
 		return buffer;
 	}
 	return "+PONG\r\n";
