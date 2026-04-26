@@ -15,6 +15,12 @@
 #include <time.h>
 #include "../headers/ListMap.h"
 
+// Thread-local transaction state for per-client isolation
+__thread bool in_transaction = false;
+__thread char **queued_commands = NULL;  // Array of queued command strings
+__thread size_t queued_count = 0;        // Number of queued commands
+__thread size_t queued_capacity = 0;     // Allocated capacity for queue
+
 typedef struct
 {
 	// Shared accept-loop state passed to the background accept thread.
@@ -271,16 +277,61 @@ static bool parse_bulk_string(const char *input, const char **cursor, char *outp
 	return true;
 }
 
+// Initialize the command queue for a new transaction
+static void init_queue(void)
+{
+	queued_commands = NULL;
+	queued_count = 0;
+	queued_capacity = 0;
+}
+
+// Free all queued commands and reset queue state
+static void free_queue(void)
+{
+	for (size_t i = 0; i < queued_count; ++i)
+	{
+		free(queued_commands[i]);
+	}
+	free(queued_commands);
+	init_queue();
+}
+
+// Add a command to the queue, resizing if necessary
+// Returns true on success, false on allocation failure
+static bool add_to_queue(const char *command)
+{
+	if (queued_count >= queued_capacity)
+	{
+		size_t new_capacity = queued_capacity == 0 ? 16 : queued_capacity * 2;  // Exponential growth
+		char **new_commands = realloc(queued_commands, new_capacity * sizeof(char *));
+		if (new_commands == NULL)
+		{
+			return false;
+		}
+		queued_commands = new_commands;
+		queued_capacity = new_capacity;
+	}
+	queued_commands[queued_count] = strdup(command);
+	if (queued_commands[queued_count] == NULL)
+	{
+		return false;
+	}
+	queued_count++;
+	return true;
+}
+
 // Core RESP command dispatcher.
-// Variable-size responses are written into the caller-provided buffer so each
-// client thread has isolated response storage.
+// Parses RESP protocol input and executes commands.
+// Responses are written to the provided buffer for thread safety.
 const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 {
+	// Handle non-array inputs (e.g., PING) with a simple PONG
 	if (input[0] != '*')
 	{
 		return "+PONG\r\n";
 	}
 
+	// Parse the command name from the first bulk string
 	char *dollar = strstr(input, "$");
 	if (dollar == NULL)
 	{
@@ -289,9 +340,23 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 	int cmd_len = atoi(dollar + 1);
 	char *cmd_start = strstr(dollar, "\r\n") + 2;
 
-	if (strncasecmp(cmd_start, "echo", 4) == 0)
+	// During a transaction, queue non-transaction commands
+	if (in_transaction &&
+	    strncasecmp(cmd_start, "MULTI", 5) != 0 &&
+	    strncasecmp(cmd_start, "EXEC", 4) != 0 &&
+	    strncasecmp(cmd_start, "DISCARD", 7) != 0)
 	{
-		// ECHO returns the exact payload as a bulk string.
+		if (!add_to_queue(input))
+		{
+			return "-ERR queue full\r\n";
+		}
+		return "+QUEUED\r\n";
+	}
+
+	// Command dispatch based on command name
+	if (strncasecmp(cmd_start, "ECHO", 4) == 0)
+	{
+		// ECHO: Return the argument as a bulk string
 		char *next_dollar = strstr(cmd_start + 1, "$");
 		if (next_dollar == NULL)
 		{
@@ -306,9 +371,9 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 	{
 		return "+PONG\r\n";
 	}
-	else if (strncasecmp(cmd_start, "get", 3) == 0)
+	else if (strncasecmp(cmd_start, "GET", 3) == 0)
 	{
-		// GET reads string keys only; non-strings resolve as nil.
+		// GET: Retrieve the value for a key, returning nil if not found or expired
 		const char *cursor = cmd_start + cmd_len;
 		char key_buf[513];
 
@@ -328,9 +393,9 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 		pthread_mutex_unlock(&listmap_mutex);
 		return "$-1\r\n";
 	}
-	else if (strncasecmp(cmd_start, "set", 3) == 0)
+	else if (strncasecmp(cmd_start, "SET", 3) == 0)
 	{
-		// SET supports optional EX/PX expiration.
+		// SET: Store key-value pair with optional expiration
 		const char *cursor = cmd_start + cmd_len;
 		char key_buf[513];
 		char value_buf[513];
@@ -1321,6 +1386,79 @@ const char *resp_parse(const char *input, char *buffer, size_t buffer_size)
 		*ptr = '\0';
 		pthread_mutex_unlock(&listmap_mutex);
 		return buffer;
+	} else if (strncasecmp(cmd_start, "INCR", 4) == 0)
+	{
+		// INCR: Increment the integer value of a key by 1
+		const char *cursor = cmd_start + cmd_len;
+		char key_buf[513];
+
+		if (!parse_bulk_string(input, &cursor, key_buf, sizeof(key_buf)))
+		{
+			return "-ERR\r\n";
+		}
+		pthread_mutex_lock(&listmap_mutex);
+		int64_t now_ms = current_time_millis();
+		int64_t result = incrementKey(listmap, key_buf, now_ms);
+		pthread_mutex_unlock(&listmap_mutex);
+		if (result == -1)
+		{
+			return "-ERR value is not an integer or out of range\r\n";
+		}
+		else
+		{
+			snprintf(buffer, buffer_size, ":%" PRId64 "\r\n", result);
+			return buffer;
+		}
+	} else if (strncasecmp(cmd_start, "MULTI", 5) == 0)
+	{
+		// MULTI: Start a transaction, queue subsequent commands
+		if (in_transaction)
+		{
+			return "-ERR MULTI calls cannot be nested\r\n";
+		}
+		in_transaction = true;
+		free_queue();
+		init_queue();
+		return "+OK\r\n";
+	} else if (strncasecmp(cmd_start, "EXEC", 4) == 0)
+	{
+		// EXEC: Execute all queued commands and return their responses as an array
+		if (!in_transaction)
+		{
+			return "-ERR EXEC without MULTI\r\n";
+		}
+		in_transaction = false;
+		size_t response_count = queued_count;
+		size_t pos = 0;
+		pos += snprintf(buffer + pos, buffer_size - pos, "*%zu\r\n", response_count);
+		for (size_t i = 0; i < queued_count; ++i)
+		{
+			const char *resp = resp_parse(queued_commands[i], buffer + pos, buffer_size - pos);
+			size_t len = strlen(resp);
+			if (pos + len >= buffer_size)
+			{
+				free_queue();
+				return "-ERR response buffer overflow\r\n";
+			}
+			if (resp != buffer + pos)
+			{
+				memcpy(buffer + pos, resp, len);
+			}
+			pos += len;
+		}
+		buffer[pos] = '\0';
+		free_queue();
+		return buffer;
+	} else if (strncasecmp(cmd_start, "DISCARD", 7) == 0)
+	{
+		// DISCARD: Abort the transaction and discard queued commands
+		if (!in_transaction)
+		{
+			return "-ERR DISCARD without MULTI\r\n";
+		}
+		in_transaction = false;
+		free_queue();
+		return "+OK\r\n";
 	}
 	return "+PONG\r\n";
 }
